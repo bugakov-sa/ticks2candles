@@ -1,13 +1,19 @@
+import java.io.{File, PrintWriter}
 import java.nio.file.Paths
 
 import akka.actor._
 import akka.event.Logging
 
 import scala.collection.mutable
+import scala.io.Source
+
+object Utils {
+  val qshFileNamePattern = "OrdLog.([a-zA-Z]+-\\d+.\\d+).(\\d{4}.\\d{1,2}.\\d{1,2}).qsh".r
+}
 
 case class MainTask(inputDir: String, outputDir: String, converterPath: String, timeframes: List[Int])
 
-case class ChildTask(inputFile: String, outputFile: String, converterFile: String, timeframes: List[Int])
+case class ChildTask(inputFile: String, outputFiles: Map[Int, String], converterFile: String)
 
 case class ChildTaskReady(inputFile: String)
 
@@ -21,7 +27,7 @@ class ParentActor(val task: MainTask) extends Actor {
   try {
     val dirs = Paths.get(task.inputDir).toFile.listFiles()
     log.info("{} days", dirs.length)
-    files ++= dirs.flatMap(f => f.listFiles).map(f => f.getAbsolutePath).toBuffer
+    files ++= dirs.flatMap(f => f.listFiles).map(f => f.getAbsolutePath).filter(n => n.endsWith(".qsh")).toBuffer
     log.info("{} files", files.size)
   }
   catch {
@@ -34,7 +40,10 @@ class ParentActor(val task: MainTask) extends Actor {
   log.info("Starting {} child actors", processors)
 
   def sendChildTask(actor: ActorRef) = {
-    actor ! ChildTask(files(0), "", task.converterPath, task.timeframes)
+    val Utils.qshFileNamePattern(code, date) = Paths.get(files(0)).getFileName.toString
+    val outputFiles = task.timeframes.map(t => (t, Paths.get(task.outputDir, code, date + "-" + t + ".csv").toString)).toMap
+    Paths.get(task.outputDir, code).toFile.mkdirs
+    actor ! ChildTask(files(0), outputFiles, task.converterPath)
     proc_files += files(0)
     files.remove(0)
   }
@@ -52,20 +61,25 @@ class ParentActor(val task: MainTask) extends Actor {
     case msg: ChildTaskReady =>
       proc_files -= msg.inputFile
       ok_files += msg.inputFile
-      if (files.isEmpty) {
-        if (proc_files.isEmpty) {
-          log.info("Fail files {}", err_files)
-          log.info("Report: total: {}, success: {}, fail: {} files", ok_files.size + err_files.size, ok_files.size, err_files.size)
-          context.system.terminate
-        }
-      }
-      else {
-        sendChildTask(sender)
-      }
+      nextFile
     case msg: ChildTaskError =>
       proc_files -= msg.inputFile
       err_files += msg.inputFile
       log.error("Error at file " + msg.inputFile + " : " + msg.e.getMessage, msg.e)
+      nextFile
+  }
+
+  def nextFile = {
+    if (files.isEmpty) {
+      if (proc_files.isEmpty) {
+        log.info("Fail files {}", err_files)
+        log.info("Report: total: {}, success: {}, fail: {} files", ok_files.size + err_files.size, ok_files.size, err_files.size)
+        context.system.terminate
+      }
+    }
+    else {
+      sendChildTask(sender)
+    }
   }
 }
 
@@ -87,8 +101,69 @@ class ChildActor extends Actor {
   }
 
   def executeTask(task: ChildTask) = {
-    //convert to txt
-    //calculate candles
+    import sys.process._
+    (task.converterFile + " " + task.inputFile) !
+
+    val _txtFile = txtFile(task.inputFile)
+    try {
+      task.outputFiles.foreach(p => calculateCandles(_txtFile, p._2, p._1))
+    }
+    finally {
+      new File((_txtFile)).delete()
+    }
+  }
+
+  def txtFile(inputFile:String):String = {
+    val inputFileName = Paths.get(inputFile).getFileName.toString
+    val inputFilePath = Paths.get(inputFile).getParent
+    val tempFileName = inputFilePath.toFile.list.filter(name => {
+      val Utils.qshFileNamePattern(code, date) = inputFileName
+      name.contains(code) && name.contains(date) && name.endsWith(".txt")
+    })(0)
+    Paths.get(inputFilePath.toString, tempFileName).toString
+  }
+
+  class Candle(val open: String) {
+    var low = open
+    var high = open
+    var close = open
+
+    def add(price: String) = {
+      if (low.toFloat > price.toFloat) {
+        low = price
+      }
+      if (high.toFloat < price.toFloat) {
+        high = price
+      }
+      close = price
+    }
+  }
+
+  def calculateCandles(inputFile: String, outputFile: String, timeframe: Int) = {
+    val candles = scala.collection.mutable.LinkedHashMap[String, ChildActor.this.Candle]()
+    val src = Source.fromFile(inputFile)
+    var candleTime = ""
+    for(line <- src.getLines() if line.contains("Fill") && line.contains("Quote") && !line.contains("NonSystem")) {
+      val cells = line.split(";")
+      val timeText = cells(1)
+      val priceText = cells(7)
+      //todo
+      if(candleTime.isEmpty) {
+        candleTime = timeText
+      }
+      if(candles.contains(candleTime)) {
+        candles(candleTime).add(priceText)
+      }
+      else {
+        candles(candleTime) = new Candle(priceText)
+      }
+    }
+    src.close()
+    val out = new PrintWriter(outputFile)
+    for((t, c) <- candles) {
+      out.write(t + ";" + c.open + ";" + c.low + ";" + c.high + ";" + c.close)
+    }
+    out.close()
   }
 }
 
@@ -100,8 +175,8 @@ object Application extends App {
   val task = MainTask(
     Paths.get(parentDir, workDir, "input").toString,
     Paths.get(parentDir, workDir, "output").toString,
-    Paths.get(parentDir, workDir).toString,
-    List(60, 5 * 60, 15 * 60, 60 * 60)
+    Paths.get(parentDir, workDir, "qsh2txt.exe").toString,
+    List(60 * 60)
   )
 
   ActorSystem.create("ticks2candles").actorOf(Props(new ParentActor(task)), name = "Parent")
