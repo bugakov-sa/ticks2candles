@@ -1,5 +1,7 @@
 import java.io.{File, PrintWriter}
 import java.nio.file.Paths
+import java.text.SimpleDateFormat
+import java.util.{TimeZone, Date}
 
 import akka.actor._
 import akka.event.Logging
@@ -9,6 +11,10 @@ import scala.io.Source
 
 object Utils {
   val qshFileNamePattern = "OrdLog.([a-zA-Z]+-\\d+.\\d+).(\\d{4}.\\d{1,2}.\\d{1,2}).qsh".r
+  val txtTimestampFormat = new SimpleDateFormat("dd.MM.yyyy HH:mm:ss.SSS")
+  txtTimestampFormat.setTimeZone(TimeZone.getTimeZone("GMT"))
+  val csvTimestampFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
+  csvTimestampFormat.setTimeZone(TimeZone.getTimeZone("GMT"))
 }
 
 case class MainTask(inputDir: String, outputDir: String, converterPath: String, timeframes: List[Int])
@@ -113,7 +119,7 @@ class ChildActor extends Actor {
     }
   }
 
-  def txtFile(inputFile:String):String = {
+  def txtFile(inputFile: String): String = {
     val inputFileName = Paths.get(inputFile).getFileName.toString
     val inputFilePath = Paths.get(inputFile).getParent
     val tempFileName = inputFilePath.toFile.list.filter(name => {
@@ -142,26 +148,27 @@ class ChildActor extends Actor {
   def calculateCandles(inputFile: String, outputFile: String, timeframe: Int) = {
     val candles = scala.collection.mutable.LinkedHashMap[String, ChildActor.this.Candle]()
     val src = Source.fromFile(inputFile)
-    var candleTime = ""
-    for(line <- src.getLines() if line.contains("Fill") && line.contains("Quote") && !line.contains("NonSystem")) {
+    for (line <- src.getLines() if line.contains("Fill") && line.contains("Quote") && !line.contains("NonSystem")) {
       val cells = line.split(";")
-      val timeText = cells(1)
       val priceText = cells(7)
-      //todo
-      if(candleTime.isEmpty) {
-        candleTime = timeText
-      }
-      if(candles.contains(candleTime)) {
-        candles(candleTime).add(priceText)
-      }
-      else {
-        candles(candleTime) = new Candle(priceText)
+      val exTime = (Utils.txtTimestampFormat.parse(cells(1)).getTime / timeframe) * timeframe + timeframe / 2
+      val recTime = (Utils.txtTimestampFormat.parse(cells(0)).getTime / timeframe) * timeframe + timeframe / 2
+      val h = (recTime % (24 * 60 * 60 * 1000)) / (60 * 60 * 1000)
+      if (h >= 10) {
+        val candleTime = Utils.csvTimestampFormat.format(new Date(exTime))
+        if (candles.contains(candleTime)) {
+          candles(candleTime).add(priceText)
+        }
+        else {
+          candles(candleTime) = new Candle(priceText)
+        }
       }
     }
     src.close()
     val out = new PrintWriter(outputFile)
-    for((t, c) <- candles) {
-      out.write(t + ";" + c.open + ";" + c.low + ";" + c.high + ";" + c.close)
+    out.write("t,open,high,low,close\n")
+    for ((t, c) <- candles) {
+      out.write(t + "," + c.open + "," + c.high + "," + c.low + "," + c.close + "\n")
     }
     out.close()
   }
@@ -176,7 +183,7 @@ object Application extends App {
     Paths.get(parentDir, workDir, "input").toString,
     Paths.get(parentDir, workDir, "output").toString,
     Paths.get(parentDir, workDir, "qsh2txt.exe").toString,
-    List(60 * 60)
+    List(60 * 60 * 1000, 15 * 60 * 1000, 5 * 60 * 1000, 60 * 1000)
   )
 
   ActorSystem.create("ticks2candles").actorOf(Props(new ParentActor(task)), name = "Parent")
