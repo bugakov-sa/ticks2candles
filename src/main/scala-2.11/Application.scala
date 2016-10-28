@@ -10,11 +10,7 @@ import scala.collection.mutable
 import scala.io.Source
 
 object Utils {
-  val qshFileNamePattern = "OrdLog.([a-zA-Z]+-\\d+.\\d+).(\\d{4}.\\d{1,2}.\\d{1,2}).qsh".r
-  val txtTimestampFormat = new SimpleDateFormat("dd.MM.yyyy HH:mm:ss.SSS")
-  txtTimestampFormat.setTimeZone(TimeZone.getTimeZone("GMT"))
-  val csvTimestampFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
-  csvTimestampFormat.setTimeZone(TimeZone.getTimeZone("GMT"))
+  val qshFileNamePattern = "OrdLog.(\\w+-\\d+.\\d+).(\\d{4}.\\d{1,2}.\\d{1,2}).qsh".r
 }
 
 case class MainTask(inputDir: String, outputDir: String, converterPath: String, timeframes: List[Int])
@@ -30,11 +26,13 @@ class ParentActor(val task: MainTask) extends Actor {
   log.info("Started with {}", task)
 
   val files = mutable.Buffer[String]()
+  var totalFilesCount = 0
   try {
     val dirs = Paths.get(task.inputDir).toFile.listFiles()
     log.info("{} days", dirs.length)
     files ++= dirs.flatMap(f => f.listFiles).map(f => f.getAbsolutePath).filter(n => n.endsWith(".qsh")).toBuffer
-    log.info("{} files", files.size)
+    totalFilesCount = files.size
+    log.info("{} files", totalFilesCount)
   }
   catch {
     case th: Throwable =>
@@ -67,19 +65,33 @@ class ParentActor(val task: MainTask) extends Actor {
     case msg: ChildTaskReady =>
       proc_files -= msg.inputFile
       ok_files += msg.inputFile
-      nextFile
+      tryProcNextFile
     case msg: ChildTaskError =>
       proc_files -= msg.inputFile
       err_files += msg.inputFile
       log.error("Error at file " + msg.inputFile + " : " + msg.e.getMessage, msg.e)
-      nextFile
+      msg.e.printStackTrace()
+      tryProcNextFile
   }
 
-  def nextFile = {
+  def tryProcNextFile = {
+    val processedFraction = (ok_files.size + err_files.size).toFloat / totalFilesCount
+    log.info("Report: processed {}/{} ~ {} %"
+      , ok_files.size + err_files.size
+      , totalFilesCount
+      , Math.round(processedFraction * 10000f) / 100f
+    )
     if (files.isEmpty) {
       if (proc_files.isEmpty) {
-        log.info("Fail files {}", err_files)
-        log.info("Report: total: {}, success: {}, fail: {} files", ok_files.size + err_files.size, ok_files.size, err_files.size)
+        if (!err_files.isEmpty) {
+          log.info("Fail files")
+          err_files.foreach(f => log.info(f))
+        }
+        log.info("Report: completed (total / success / failure) {} / {} / {} files"
+          , ok_files.size + err_files.size
+          , ok_files.size
+          , err_files.size
+        )
         context.system.terminate
       }
     }
@@ -91,7 +103,7 @@ class ParentActor(val task: MainTask) extends Actor {
 
 class ChildActor extends Actor {
   val log = Logging(context.system, this)
-  log.info("Started {}", context.self)
+  log.debug("Started {}", context.self)
 
   override def receive: Actor.Receive = {
     case task: ChildTask =>
@@ -108,7 +120,7 @@ class ChildActor extends Actor {
 
   def executeTask(task: ChildTask) = {
     import sys.process._
-    (task.converterFile + " " + task.inputFile) !
+    (task.converterFile + " " + task.inputFile) ! ProcessLogger(s => {})
 
     val _txtFile = txtFile(task.inputFile)
     try {
@@ -145,17 +157,24 @@ class ChildActor extends Actor {
     }
   }
 
+  val txtTimestampFormat = new SimpleDateFormat("dd.MM.yyyy HH:mm:ss.SSS")
+  txtTimestampFormat.setTimeZone(TimeZone.getTimeZone("GMT"))
+  def millisFromTxt(timeText:String) = txtTimestampFormat.parse(timeText).getTime
+
+  val csvTimestampFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
+  csvTimestampFormat.setTimeZone(TimeZone.getTimeZone("GMT"))
+  def millis2Csv(millis:Long) = csvTimestampFormat.format(new Date(millis))
+
   def calculateCandles(inputFile: String, outputFile: String, timeframe: Int) = {
     val candles = scala.collection.mutable.LinkedHashMap[String, ChildActor.this.Candle]()
     val src = Source.fromFile(inputFile)
     for (line <- src.getLines() if line.contains("Fill") && line.contains("Quote") && !line.contains("NonSystem")) {
       val cells = line.split(";")
       val priceText = cells(7)
-      val exTime = (Utils.txtTimestampFormat.parse(cells(1)).getTime / timeframe) * timeframe + timeframe / 2
-      val recTime = (Utils.txtTimestampFormat.parse(cells(0)).getTime / timeframe) * timeframe + timeframe / 2
-      val h = (recTime % (24 * 60 * 60 * 1000)) / (60 * 60 * 1000)
+      val exTime = (millisFromTxt(cells(1)) / timeframe) * timeframe
+      val h = (millisFromTxt(cells(0)) % (24 * 60 * 60 * 1000)) / (60 * 60 * 1000)
       if (h >= 10) {
-        val candleTime = Utils.csvTimestampFormat.format(new Date(exTime))
+        val candleTime = millis2Csv(exTime + timeframe / 2)
         if (candles.contains(candleTime)) {
           candles(candleTime).add(priceText)
         }
