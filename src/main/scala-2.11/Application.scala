@@ -115,7 +115,14 @@ class ChildActor extends Actor {
 
     val _txtFile = txtFile(task.inputFile)
     try {
-      task.outputFiles.foreach(p => calculateCandles(_txtFile, p._2, p._1))
+      val src = Source.fromFile(_txtFile)
+      val candlesBatches = task.outputFiles.map(p => (p._2, new CandlesBatch(p._1)))
+      for (line <- src.getLines() if line.contains("Fill") && line.contains("Quote") && !line.contains("NonSystem")) {
+        val cells = line.split(";")
+        candlesBatches.values.foreach(cb => cb.add(cells(0), cells(1), cells(7)))
+      }
+      src.close()
+      candlesBatches.foreach(p => p._2.save2csv(p._1))
     }
     finally {
       new File((_txtFile)).delete()
@@ -131,6 +138,16 @@ class ChildActor extends Actor {
     })(0)
     Paths.get(inputFilePath.toString, tempFileName).toString
   }
+
+  val txtTimestampFormat = new SimpleDateFormat("dd.MM.yyyy HH:mm:ss.SSS")
+  txtTimestampFormat.setTimeZone(TimeZone.getTimeZone("GMT"))
+
+  def millisFromTxt(timeText: String) = txtTimestampFormat.parse(timeText).getTime
+
+  val csvTimestampFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
+  csvTimestampFormat.setTimeZone(TimeZone.getTimeZone("GMT"))
+
+  def millis2Csv(millis: Long) = csvTimestampFormat.format(new Date(millis))
 
   class Candle(val open: String) {
     var low = open
@@ -148,41 +165,30 @@ class ChildActor extends Actor {
     }
   }
 
-  val txtTimestampFormat = new SimpleDateFormat("dd.MM.yyyy HH:mm:ss.SSS")
-  txtTimestampFormat.setTimeZone(TimeZone.getTimeZone("GMT"))
-
-  def millisFromTxt(timeText: String) = txtTimestampFormat.parse(timeText).getTime
-
-  val csvTimestampFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
-  csvTimestampFormat.setTimeZone(TimeZone.getTimeZone("GMT"))
-
-  def millis2Csv(millis: Long) = csvTimestampFormat.format(new Date(millis))
-
-  def calculateCandles(inputFile: String, outputFile: String, timeframe: Int) = {
+  class CandlesBatch(val timeframe: Int) {
     val candles = scala.collection.mutable.LinkedHashMap[String, ChildActor.this.Candle]()
-    val src = Source.fromFile(inputFile)
-    for (line <- src.getLines() if line.contains("Fill") && line.contains("Quote") && !line.contains("NonSystem")) {
-      val cells = line.split(";")
-      val priceText = cells(7)
-      val candleTimeMillis = (millisFromTxt(cells(1)) / timeframe) * timeframe + timeframe / 2
-      val h = (millisFromTxt(cells(0)) % (24 * 60 * 60 * 1000)) / (60 * 60 * 1000)
-      if (h >= 10) {
-        val candleTime = millis2Csv(candleTimeMillis)
+
+    def add(receiveTime: String, exchangeTime: String, price: String) = {
+      val receiveTimeHour = (millisFromTxt(receiveTime) % (24 * 60 * 60 * 1000)) / (60 * 60 * 1000)
+      if (receiveTimeHour >= 10) {
+        val candleTime = millis2Csv((millisFromTxt(exchangeTime) / timeframe) * timeframe + timeframe / 2)
         if (candles.contains(candleTime)) {
-          candles(candleTime).add(priceText)
+          candles(candleTime).add(price)
         }
         else {
-          candles(candleTime) = new Candle(priceText)
+          candles(candleTime) = new Candle(price)
         }
       }
     }
-    src.close()
-    val out = new PrintWriter(outputFile)
-    out.write("t,open,high,low,close\n")
-    for ((t, c) <- candles) {
-      out.write(t + "," + c.open + "," + c.high + "," + c.low + "," + c.close + "\n")
+
+    def save2csv(csvPath: String) = {
+      val out = new PrintWriter(csvPath)
+      out.write("t,open,high,low,close\n")
+      for ((t, c) <- candles) {
+        out.write(t + "," + c.open + "," + c.high + "," + c.low + "," + c.close + "\n")
+      }
+      out.close()
     }
-    out.close()
   }
 }
 
