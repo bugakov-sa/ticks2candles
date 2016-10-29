@@ -1,0 +1,4 @@
+inputDir = ..\work\input
+outputDir = ..\work\output
+converterPath = ..\work\qsh2txt.exe
+timeframes = 60000 300000 900000 3600000

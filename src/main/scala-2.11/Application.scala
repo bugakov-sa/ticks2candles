@@ -13,50 +13,77 @@ object Utils {
   val qshFileNamePattern = "OrdLog.(\\w+-\\d+.\\d+).(\\d{4}.\\d{1,2}.\\d{1,2}).qsh".r
 }
 
-case class MainTask(inputDir: String, outputDir: String, converterPath: String, timeframes: List[Int])
-
 case class ChildTask(inputFile: String, outputFiles: Map[Int, String], converterFile: String)
 
 case class ChildTaskSuccess(inputFile: String)
 
 case class ChildTaskFailure(inputFile: String, e: Exception)
 
-class ParentActor(val task: MainTask) extends Actor {
+class ParentActor extends Actor {
   val log = Logging(context.system, this)
-  log.info("Started with {}", task)
+
+  var inputDir = ""
+  var outputDir = ""
+  var converterPath = ""
+  var timeframes = List[Int]()
 
   val files = mutable.Buffer[String]()
-  try {
-    val dirs = Paths.get(task.inputDir).toFile.listFiles
-    log.info("Found {} days", dirs.length)
-    files ++= dirs.flatMap(f => f.listFiles).map(f => f.getAbsolutePath).filter(n => n.endsWith(".qsh"))
-  }
-  catch {
-    case th: Throwable =>
-      log.error("Error at creating index: " + th.getMessage, th)
-      context.system.terminate
-  }
-  val totalFilesCount = files.size
-  log.info("Found {} files", totalFilesCount)
-
   val proc_files = mutable.Buffer[String]()
   val ok_files = mutable.Buffer[String]()
   val err_files = mutable.Buffer[String]()
 
+  var totalFilesCount = 0
+
+  try {
+    init
+  }
+  catch {
+    case th: Throwable =>
+      log.info("Error at creating actor " + th.getMessage, th)
+      th.printStackTrace
+      context.system.terminate
+  }
+
+  def init = {
+    //find settings.txt
+    val paths = Array("settings.txt", "conf\\settings.txt")
+    val availableSettingsFiles = paths.map(path => (path, new File(path).exists)).filter(p => p._2).map(p => p._1)
+    if (availableSettingsFiles.isEmpty) throw new Exception("Not found settings.txt")
+    //read settings
+    val src = Source.fromFile(availableSettingsFiles(0))
+    val settings = (for (kv <- src.getLines.map(ln => ln.split("=")) if kv.length == 2)
+      yield (kv(0).trim, kv(1).trim)).toMap
+    src.close
+    log.info("Settings:")
+    for ((k, v) <- settings) log.info(k + "=" + v)
+    inputDir = settings("inputDir")
+    outputDir = settings("outputDir")
+    converterPath = settings("converterPath")
+    timeframes = settings("timeframes").split(" ").map(s => s.toInt).toList
+    //list input files
+    val inputDirFile = Paths.get(inputDir).toFile
+    if(!inputDirFile.exists) throw new Exception(inputDir + " - input dir not found")
+    val dirs = inputDirFile.listFiles
+    log.info("Found {} days", dirs.length)
+    files ++= dirs.flatMap(f => f.listFiles).map(f => f.getAbsolutePath).filter(n => n.endsWith(".qsh"))
+    totalFilesCount = files.size
+    log.info("Found {} files", totalFilesCount)
+    //start child actors
+    val processors = Runtime.getRuntime.availableProcessors
+    log.info("Starting {} child actors", processors)
+    (1 to math.min(processors, files.size))
+      .map(i => context.actorOf(Props[ChildActor]))
+      .foreach(a => sendChildTask(a))
+  }
+
   def sendChildTask(actor: ActorRef) = {
     val Utils.qshFileNamePattern(code, date) = Paths.get(files(0)).getFileName.toString
-    val outputFiles = task.timeframes.map(t => (t, Paths.get(task.outputDir, code, date + "-" + t + ".csv").toString)).toMap
-    Paths.get(task.outputDir, code).toFile.mkdirs
-    actor ! ChildTask(files(0), outputFiles, task.converterPath)
+    val outputFiles = timeframes.map(t => (t, Paths.get(outputDir, code, date + "-" + t + ".csv").toString)).toMap
+    Paths.get(outputDir, code).toFile.mkdirs
+    actor ! ChildTask(files(0), outputFiles, converterPath)
     proc_files += files(0)
     files.remove(0)
   }
-
-  val processors = Runtime.getRuntime.availableProcessors
-  log.info("Starting {} child actors", processors)
-  (1 to math.min(processors, files.size))
-    .map(i => context.actorOf(Props[ChildActor]))
-    .foreach(a => sendChildTask(a))
 
   override def receive: Receive = {
     case msg: ChildTaskSuccess =>
@@ -193,16 +220,5 @@ class ChildActor extends Actor {
 }
 
 object Application extends App {
-
-  val parentDir = Paths.get(System.getProperty("user.dir")).getParent.toString
-  val workDir = "work"
-
-  val task = MainTask(
-    Paths.get(parentDir, workDir, "input").toString,
-    Paths.get(parentDir, workDir, "output").toString,
-    Paths.get(parentDir, workDir, "qsh2txt.exe").toString,
-    List(60 * 60 * 1000, 15 * 60 * 1000, 5 * 60 * 1000, 60 * 1000)
-  )
-
-  ActorSystem.create("ticks2candles").actorOf(Props(new ParentActor(task)), name = "Parent")
+  ActorSystem.create("ticks2candles").actorOf(Props[ParentActor])
 }
