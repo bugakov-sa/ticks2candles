@@ -1,3 +1,9 @@
+/*
+TODO:
+1. Писать логи в файл
+2. Логировать длительность работы
+3. Отвязаться от фиксированной структуры папок с входными данными
+ */
 import java.io.{File, PrintWriter}
 import java.nio.file.Paths
 import java.text.SimpleDateFormat
@@ -62,7 +68,7 @@ class ParentActor extends Actor {
     timeframes = settings("timeframes").split(" ").map(s => s.toInt).toList
     //list input files
     val inputDirFile = Paths.get(inputDir).toFile
-    if(!inputDirFile.exists) throw new Exception(inputDir + " - input dir not found")
+    if (!inputDirFile.exists) throw new Exception(inputDir + " - input dir not found")
     val dirs = inputDirFile.listFiles
     log.info("Found {} days", dirs.length)
     files ++= dirs.flatMap(f => f.listFiles).map(f => f.getAbsolutePath).filter(n => n.endsWith(".qsh"))
@@ -102,15 +108,16 @@ class ParentActor extends Actor {
     val processedCount = ok_files.size + err_files.size
     val processedFraction = processedCount.toFloat / totalFilesCount
     val processedPercent = Math.round(processedFraction * 10000f) / 100f
-    log.info("Report: processed {}/{} ~ {} %", processedCount, totalFilesCount, processedPercent)
+    log.info("Report: processed {}/{} ~ {} %",
+      processedCount, totalFilesCount, processedPercent)
     if (files.isEmpty) {
       if (proc_files.isEmpty) {
         if (!err_files.isEmpty) {
           log.info("Report: failure files:")
           err_files.foreach(f => log.info(f))
         }
-        log.info("Report: completed (total / success / failure) {} / {} / {} files"
-          , processedCount, ok_files.size, err_files.size)
+        log.info("Report: completed (total / success / failure) {} / {} / {} files",
+          processedCount, ok_files.size, err_files.size)
         context.system.terminate
       }
     }
@@ -131,8 +138,14 @@ class ChildActor extends Actor {
         sender ! ChildTaskSuccess(task.inputFile)
       }
       catch {
-        case th: Throwable =>
-          sender ! ChildTaskFailure(task.inputFile, new Exception(th))
+        case e: Exception =>
+          sender ! ChildTaskFailure(task.inputFile, e)
+      }
+      finally {
+        val txtFileOption = txtFile(task.inputFile)
+        if (!txtFileOption.isEmpty) {
+          new File(txtFileOption.get).delete
+        }
       }
   }
 
@@ -140,30 +153,29 @@ class ChildActor extends Actor {
     import sys.process._
     (task.converterFile + " " + task.inputFile) ! ProcessLogger(s => {})
 
-    val _txtFile = txtFile(task.inputFile)
-    try {
-      val src = Source.fromFile(_txtFile)
+    val txtFileOption = txtFile(task.inputFile)
+    if (!txtFileOption.isEmpty) {
+      val src = Source.fromFile(txtFileOption.get)
       val candlesBatches = task.outputFiles.map(p => (p._2, new CandlesBatch(p._1)))
-      for (line <- src.getLines() if line.contains("Fill") && line.contains("Quote") && !line.contains("NonSystem")) {
+      for (line <- src.getLines() if filterLine(line)) {
         val cells = line.split(";")
         candlesBatches.values.foreach(cb => cb.add(cells(0), cells(1), cells(7)))
       }
       src.close()
       candlesBatches.foreach(p => p._2.save2csv(p._1))
     }
-    finally {
-      new File((_txtFile)).delete()
-    }
   }
 
-  def txtFile(inputFile: String): String = {
+  def filterLine(line: String) = line.contains("Fill") && line.contains("Quote") && !line.contains("NonSystem")
+
+  def txtFile(inputFile: String): Option[String] = {
     val inputFileName = Paths.get(inputFile).getFileName.toString
     val inputFilePath = Paths.get(inputFile).getParent
-    val tempFileName = inputFilePath.toFile.list.filter(name => {
+    val tempFileNames = inputFilePath.toFile.list.filter(name => {
       val Utils.qshFileNamePattern(code, date) = inputFileName
       name.contains(code) && name.contains(date) && name.endsWith(".txt")
-    })(0)
-    Paths.get(inputFilePath.toString, tempFileName).toString
+    })
+    if (tempFileNames.isEmpty) None else Some(Paths.get(inputFilePath.toString, tempFileNames(0)).toString)
   }
 
   val txtTimestampFormat = new SimpleDateFormat("dd.MM.yyyy HH:mm:ss.SSS")
@@ -217,6 +229,7 @@ class ChildActor extends Actor {
       out.close()
     }
   }
+
 }
 
 object Application extends App {
