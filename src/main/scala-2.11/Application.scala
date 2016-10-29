@@ -17,31 +17,31 @@ case class MainTask(inputDir: String, outputDir: String, converterPath: String, 
 
 case class ChildTask(inputFile: String, outputFiles: Map[Int, String], converterFile: String)
 
-case class ChildTaskReady(inputFile: String)
+case class ChildTaskSuccess(inputFile: String)
 
-case class ChildTaskError(inputFile: String, e: Exception)
+case class ChildTaskFailure(inputFile: String, e: Exception)
 
 class ParentActor(val task: MainTask) extends Actor {
   val log = Logging(context.system, this)
   log.info("Started with {}", task)
 
   val files = mutable.Buffer[String]()
-  var totalFilesCount = 0
   try {
-    val dirs = Paths.get(task.inputDir).toFile.listFiles()
-    log.info("{} days", dirs.length)
-    files ++= dirs.flatMap(f => f.listFiles).map(f => f.getAbsolutePath).filter(n => n.endsWith(".qsh")).toBuffer
-    totalFilesCount = files.size
-    log.info("{} files", totalFilesCount)
+    val dirs = Paths.get(task.inputDir).toFile.listFiles
+    log.info("Found {} days", dirs.length)
+    files ++= dirs.flatMap(f => f.listFiles).map(f => f.getAbsolutePath).filter(n => n.endsWith(".qsh"))
   }
   catch {
     case th: Throwable =>
       log.error("Error at creating index: " + th.getMessage, th)
       context.system.terminate
   }
+  val totalFilesCount = files.size
+  log.info("Found {} files", totalFilesCount)
 
-  val processors: Int = Runtime.getRuntime.availableProcessors
-  log.info("Starting {} child actors", processors)
+  val proc_files = mutable.Buffer[String]()
+  val ok_files = mutable.Buffer[String]()
+  val err_files = mutable.Buffer[String]()
 
   def sendChildTask(actor: ActorRef) = {
     val Utils.qshFileNamePattern(code, date) = Paths.get(files(0)).getFileName.toString
@@ -52,21 +52,18 @@ class ParentActor(val task: MainTask) extends Actor {
     files.remove(0)
   }
 
-  val proc_files = mutable.Buffer[String]()
-
+  val processors = Runtime.getRuntime.availableProcessors
+  log.info("Starting {} child actors", processors)
   (1 to math.min(processors, files.size))
     .map(i => context.actorOf(Props[ChildActor]))
     .foreach(a => sendChildTask(a))
 
-  val ok_files = mutable.Buffer[String]()
-  val err_files = mutable.Buffer[String]()
-
   override def receive: Receive = {
-    case msg: ChildTaskReady =>
+    case msg: ChildTaskSuccess =>
       proc_files -= msg.inputFile
       ok_files += msg.inputFile
       tryProcNextFile
-    case msg: ChildTaskError =>
+    case msg: ChildTaskFailure =>
       proc_files -= msg.inputFile
       err_files += msg.inputFile
       log.error("Error at file " + msg.inputFile + " : " + msg.e.getMessage, msg.e)
@@ -75,23 +72,18 @@ class ParentActor(val task: MainTask) extends Actor {
   }
 
   def tryProcNextFile = {
-    val processedFraction = (ok_files.size + err_files.size).toFloat / totalFilesCount
-    log.info("Report: processed {}/{} ~ {} %"
-      , ok_files.size + err_files.size
-      , totalFilesCount
-      , Math.round(processedFraction * 10000f) / 100f
-    )
+    val processedCount = ok_files.size + err_files.size
+    val processedFraction = processedCount.toFloat / totalFilesCount
+    val processedPercent = Math.round(processedFraction * 10000f) / 100f
+    log.info("Report: processed {}/{} ~ {} %", processedCount, totalFilesCount, processedPercent)
     if (files.isEmpty) {
       if (proc_files.isEmpty) {
         if (!err_files.isEmpty) {
-          log.info("Fail files")
+          log.info("Report: failure files:")
           err_files.foreach(f => log.info(f))
         }
         log.info("Report: completed (total / success / failure) {} / {} / {} files"
-          , ok_files.size + err_files.size
-          , ok_files.size
-          , err_files.size
-        )
+          , processedCount, ok_files.size, err_files.size)
         context.system.terminate
       }
     }
@@ -107,14 +99,13 @@ class ChildActor extends Actor {
 
   override def receive: Actor.Receive = {
     case task: ChildTask =>
-      log.debug("Received {}", task)
       try {
         executeTask(task)
-        sender ! ChildTaskReady(task.inputFile)
+        sender ! ChildTaskSuccess(task.inputFile)
       }
       catch {
         case th: Throwable =>
-          sender ! ChildTaskError(task.inputFile, new Exception(th))
+          sender ! ChildTaskFailure(task.inputFile, new Exception(th))
       }
   }
 
@@ -159,11 +150,13 @@ class ChildActor extends Actor {
 
   val txtTimestampFormat = new SimpleDateFormat("dd.MM.yyyy HH:mm:ss.SSS")
   txtTimestampFormat.setTimeZone(TimeZone.getTimeZone("GMT"))
-  def millisFromTxt(timeText:String) = txtTimestampFormat.parse(timeText).getTime
+
+  def millisFromTxt(timeText: String) = txtTimestampFormat.parse(timeText).getTime
 
   val csvTimestampFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
   csvTimestampFormat.setTimeZone(TimeZone.getTimeZone("GMT"))
-  def millis2Csv(millis:Long) = csvTimestampFormat.format(new Date(millis))
+
+  def millis2Csv(millis: Long) = csvTimestampFormat.format(new Date(millis))
 
   def calculateCandles(inputFile: String, outputFile: String, timeframe: Int) = {
     val candles = scala.collection.mutable.LinkedHashMap[String, ChildActor.this.Candle]()
@@ -171,10 +164,10 @@ class ChildActor extends Actor {
     for (line <- src.getLines() if line.contains("Fill") && line.contains("Quote") && !line.contains("NonSystem")) {
       val cells = line.split(";")
       val priceText = cells(7)
-      val exTime = (millisFromTxt(cells(1)) / timeframe) * timeframe
+      val candleTimeMillis = (millisFromTxt(cells(1)) / timeframe) * timeframe + timeframe / 2
       val h = (millisFromTxt(cells(0)) % (24 * 60 * 60 * 1000)) / (60 * 60 * 1000)
       if (h >= 10) {
-        val candleTime = millis2Csv(exTime + timeframe / 2)
+        val candleTime = millis2Csv(candleTimeMillis)
         if (candles.contains(candleTime)) {
           candles(candleTime).add(priceText)
         }
