@@ -4,6 +4,7 @@ TODO:
 2. Логировать длительность работы
 3. Отвязаться от фиксированной структуры папок с входными данными
  */
+
 import java.io.{File, PrintWriter}
 import java.nio.file.Paths
 import java.text.SimpleDateFormat
@@ -15,78 +16,126 @@ import akka.event.Logging
 import scala.collection.mutable
 import scala.io.Source
 
+case class Configuration(inputFiles: List[String], outputDir: String, converterFile: String, timeframes: List[Long])
+
+object Configuration {
+
+  private val INPUT_DIR = "inputDir"
+  private val OUTPUT_DIR = "outputDir"
+  private val CONVERTER_PATH = "converterPath"
+  private val TIMEFRAMES = "timeframes"
+
+  def read: Configuration = {
+
+    val settings = readSettings
+
+    checkSettings(settings)
+
+    Configuration(
+      listInputFiles(settings(INPUT_DIR)),
+      settings(OUTPUT_DIR),
+      settings(CONVERTER_PATH),
+      parseTimeframes(settings(TIMEFRAMES))
+    )
+  }
+
+  private def findSettingsFile = {
+    val files = Array("settings.txt", "conf\\settings.txt").
+      map(path => (path, new File(path).exists)).
+      filter(p => p._2).
+      map(p => p._1)
+    if (files.isEmpty) {
+      throw new Exception("Not found settings.txt")
+    }
+    files(0)
+  }
+
+  private def readSettings = {
+    val src = Source.fromFile(findSettingsFile)
+    val settings = (for (kv <- src.getLines.map(ln => ln.split("=")) if kv.length == 2)
+      yield (kv(0).trim, kv(1).trim)).toMap
+    src.close
+
+    println("Settings:")
+    for ((k, v) <- settings) {
+      println(k + "=" + v)
+    }
+
+    settings
+  }
+
+  private def checkSettings(settings: Map[String, String]) = {
+    for (filePath <- List(INPUT_DIR, OUTPUT_DIR, CONVERTER_PATH)) {
+      if (!settings.contains(filePath)) {
+        throw new Exception("Not defined " + filePath)
+      }
+      if (!Paths.get(settings(filePath)).toFile.exists) {
+        throw new Exception("Not found " + filePath + " " + settings(filePath))
+      }
+    }
+    if (!settings.contains(TIMEFRAMES)) {
+      throw new Exception("Not defined " + TIMEFRAMES)
+    }
+    try {
+      parseTimeframes(settings(TIMEFRAMES))
+    }
+    catch {
+      case e: Exception => {
+        throw new Exception("Cannot parse " + TIMEFRAMES + " " + settings(TIMEFRAMES))
+      }
+    }
+  }
+
+  private def listInputFiles(inputDir: String) = {
+    val res = Paths.get(inputDir).
+      toFile.
+      listFiles.
+      flatMap(f => f.listFiles).
+      map(f => f.getAbsolutePath).
+      filter(n => n.endsWith(".qsh")).
+      toList
+    println("Found " + res.size + " files")
+    res
+  }
+
+  private def parseTimeframes(timeframes: String) = timeframes.
+    split(" ").
+    map(s => s.toLong).
+    toList
+}
+
 object Utils {
   val qshFileNamePattern = "OrdLog.(\\w+-\\d+.\\d+).(\\d{4}.\\d{1,2}.\\d{1,2}).qsh".r
 }
 
-case class ChildTask(inputFile: String, outputFiles: Map[Int, String], converterFile: String)
+case class ChildTask(inputFile: String, outputFiles: Map[Long, String], converterFile: String)
 
 case class ChildTaskSuccess(inputFile: String)
 
 case class ChildTaskFailure(inputFile: String, e: Exception)
 
-class ParentActor extends Actor {
+class ParentActor(val conf: Configuration) extends Actor {
   val log = Logging(context.system, this)
-
-  var inputDir = ""
-  var outputDir = ""
-  var converterPath = ""
-  var timeframes = List[Int]()
 
   val files = mutable.Buffer[String]()
   val proc_files = mutable.Buffer[String]()
   val ok_files = mutable.Buffer[String]()
   val err_files = mutable.Buffer[String]()
 
-  var totalFilesCount = 0
+  files ++= conf.inputFiles
 
-  try {
-    init
-  }
-  catch {
-    case th: Throwable =>
-      log.info("Error at creating actor " + th.getMessage, th)
-      th.printStackTrace
-      context.system.terminate
-  }
+  val processors = Runtime.getRuntime.availableProcessors
+  log.info("Starting {} child actors", processors)
 
-  def init = {
-    //find settings.txt
-    val paths = Array("settings.txt", "conf\\settings.txt")
-    val availableSettingsFiles = paths.map(path => (path, new File(path).exists)).filter(p => p._2).map(p => p._1)
-    if (availableSettingsFiles.isEmpty) throw new Exception("Not found settings.txt")
-    //read settings
-    val src = Source.fromFile(availableSettingsFiles(0))
-    val settings = (for (kv <- src.getLines.map(ln => ln.split("=")) if kv.length == 2)
-      yield (kv(0).trim, kv(1).trim)).toMap
-    src.close
-    log.info("Settings:")
-    for ((k, v) <- settings) log.info(k + "=" + v)
-    inputDir = settings("inputDir")
-    outputDir = settings("outputDir")
-    converterPath = settings("converterPath")
-    timeframes = settings("timeframes").split(" ").map(s => s.toInt).toList
-    //list input files
-    val inputDirFile = Paths.get(inputDir).toFile
-    if (!inputDirFile.exists) throw new Exception(inputDir + " - input dir not found")
-    val dirs = inputDirFile.listFiles
-    log.info("Found {} days", dirs.length)
-    files ++= dirs.flatMap(f => f.listFiles).map(f => f.getAbsolutePath).filter(n => n.endsWith(".qsh"))
-    totalFilesCount = files.size
-    log.info("Found {} files", totalFilesCount)
-    //start child actors
-    val processors = Runtime.getRuntime.availableProcessors
-    log.info("Starting {} child actors", processors)
-    (1 to math.min(processors, files.size))
-      .map(i => context.actorOf(Props[ChildActor]))
-      .foreach(a => sendChildTask(a))
-  }
+  (1 to math.min(processors, files.size))
+    .map(i => context.actorOf(Props[ChildActor]))
+    .foreach(a => sendChildTask(a))
 
   def sendChildTask(actor: ActorRef) = {
     val Utils.qshFileNamePattern(code, date) = Paths.get(files(0)).getFileName.toString
-    val outputFiles = timeframes.map(t => (t, Paths.get(outputDir, code, date + "-" + t + ".csv").toString)).toMap
-    Paths.get(outputDir, code).toFile.mkdirs
-    actor ! ChildTask(files(0), outputFiles, converterPath)
+    val outputFiles = conf.timeframes.map(t => (t, Paths.get(conf.outputDir, code, date + "-" + t + ".csv").toString)).toMap
+    Paths.get(conf.outputDir, code).toFile.mkdirs
+    actor ! ChildTask(files(0), outputFiles, conf.converterFile)
     proc_files += files(0)
     files.remove(0)
   }
@@ -106,10 +155,10 @@ class ParentActor extends Actor {
 
   def tryProcNextFile = {
     val processedCount = ok_files.size + err_files.size
-    val processedFraction = processedCount.toFloat / totalFilesCount
+    val processedFraction = processedCount.toFloat / conf.inputFiles.size
     val processedPercent = Math.round(processedFraction * 10000f) / 100f
     log.info("Report: processed {}/{} ~ {} %",
-      processedCount, totalFilesCount, processedPercent)
+      processedCount, conf.inputFiles.size, processedPercent)
     if (files.isEmpty) {
       if (proc_files.isEmpty) {
         if (!err_files.isEmpty) {
@@ -204,7 +253,7 @@ class ChildActor extends Actor {
     }
   }
 
-  class CandlesBatch(val timeframe: Int) {
+  class CandlesBatch(val timeframe: Long) {
     val candles = scala.collection.mutable.LinkedHashMap[String, ChildActor.this.Candle]()
 
     def add(receiveTime: String, exchangeTime: String, price: String) = {
@@ -229,9 +278,9 @@ class ChildActor extends Actor {
       out.close()
     }
   }
-
 }
 
 object Application extends App {
-  ActorSystem.create("ticks2candles").actorOf(Props[ParentActor])
+  val conf = Configuration.read
+  ActorSystem.create("ticks2candles").actorOf(Props(new ParentActor(conf)))
 }
