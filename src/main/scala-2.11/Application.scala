@@ -11,7 +11,6 @@ import java.text.SimpleDateFormat
 import java.util.{TimeZone, Date}
 
 import akka.actor._
-import akka.event.Logging
 
 import scala.collection.mutable
 import scala.io.Source
@@ -108,24 +107,35 @@ object Utils {
   val qshFileNamePattern = "OrdLog.(\\w+-\\d+.\\d+).(\\d{4}.\\d{1,2}.\\d{1,2}).qsh".r
 }
 
-case class ChildTask(inputFile: String, outputFiles: Map[Long, String], converterFile: String)
+object ParentActor {
 
-case class ChildTaskSuccess(inputFile: String)
+  case class ChildTaskSuccess(inputFile: String)
 
-case class ChildTaskFailure(inputFile: String, e: Exception)
+  case class ChildTaskFailure(inputFile: String, e: Exception)
+
+  def props(conf: Configuration) = Props(new ParentActor(conf))
+}
+
+object ChildActor {
+
+  case class ChildTask(inputFile: String, outputFiles: Map[Long, String], converterFile: String)
+
+}
 
 class ParentActor(val conf: Configuration) extends Actor {
-  val log = Logging(context.system, this)
+
+  import ParentActor._
+  import ChildActor._
 
   val files = mutable.Buffer[String]()
   val proc_files = mutable.Buffer[String]()
-  val ok_files = mutable.Buffer[String]()
-  val err_files = mutable.Buffer[String]()
+  val success_files = mutable.Buffer[String]()
+  val failure_files = mutable.Buffer[String]()
 
   files ++= conf.inputFiles
 
   val processors = Runtime.getRuntime.availableProcessors
-  log.info("Starting {} child actors", processors)
+  println("Starting " + processors + " child actors")
 
   (1 to math.min(processors, files.size))
     .map(i => context.actorOf(Props[ChildActor]))
@@ -143,30 +153,23 @@ class ParentActor(val conf: Configuration) extends Actor {
   override def receive: Receive = {
     case msg: ChildTaskSuccess =>
       proc_files -= msg.inputFile
-      ok_files += msg.inputFile
+      success_files += msg.inputFile
       tryProcNextFile
     case msg: ChildTaskFailure =>
       proc_files -= msg.inputFile
-      err_files += msg.inputFile
-      log.error("Error at file " + msg.inputFile + " : " + msg.e.getMessage, msg.e)
+      failure_files += msg.inputFile
+      println("Error at file " + msg.inputFile + " : " + msg.e.getMessage)
       msg.e.printStackTrace()
       tryProcNextFile
   }
 
   def tryProcNextFile = {
-    val processedCount = ok_files.size + err_files.size
-    val processedFraction = processedCount.toFloat / conf.inputFiles.size
-    val processedPercent = Math.round(processedFraction * 10000f) / 100f
-    log.info("Report: processed {}/{} ~ {} %",
-      processedCount, conf.inputFiles.size, processedPercent)
+    printReport
     if (files.isEmpty) {
       if (proc_files.isEmpty) {
-        if (!err_files.isEmpty) {
-          log.info("Report: failure files:")
-          err_files.foreach(f => log.info(f))
-        }
-        log.info("Report: completed (total / success / failure) {} / {} / {} files",
-          processedCount, ok_files.size, err_files.size)
+        println("Failure files:")
+        failure_files.foreach(println)
+        println("Terminating")
         context.system.terminate
       }
     }
@@ -174,11 +177,25 @@ class ParentActor(val conf: Configuration) extends Actor {
       sendChildTask(sender)
     }
   }
+
+  def printReport = {
+
+    val total = conf.inputFiles.size
+    val processed = success_files.size + failure_files.size
+    val percent = Math.round((processed.toFloat / total) * 10000f) / 100f
+
+    println(new Date +
+      " progress(%) " + percent +
+      " success " + success_files.size +
+      " failure " + failure_files.size +
+      " total " + total)
+  }
 }
 
 class ChildActor extends Actor {
-  val log = Logging(context.system, this)
-  log.debug("Started {}", context.self)
+
+  import ChildActor._
+  import ParentActor._
 
   override def receive: Actor.Receive = {
     case task: ChildTask =>
@@ -278,9 +295,10 @@ class ChildActor extends Actor {
       out.close()
     }
   }
+
 }
 
 object Application extends App {
   val conf = Configuration.read
-  ActorSystem.create("ticks2candles").actorOf(Props(new ParentActor(conf)))
+  ActorSystem.create("ticks2candles").actorOf(ParentActor.props(conf))
 }
