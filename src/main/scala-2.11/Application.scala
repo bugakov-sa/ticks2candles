@@ -15,7 +15,13 @@ import akka.actor._
 import scala.collection.mutable
 import scala.io.Source
 
-case class Configuration(inputFiles: List[String], outputDir: String, converterFile: String, timeframes: List[Long])
+case class Configuration(
+                          inputFiles: List[String],
+                          outputDir: String,
+                          converterFile: String,
+                          timeframes: List[Long],
+                          threads: Int
+                        )
 
 object Configuration {
 
@@ -23,6 +29,7 @@ object Configuration {
   private val OUTPUT_DIR = "outputDir"
   private val CONVERTER_PATH = "converterPath"
   private val TIMEFRAMES = "timeframes"
+  private val THREADS = "threads"
 
   def read: Configuration = {
 
@@ -34,7 +41,8 @@ object Configuration {
       listInputFiles(settings(INPUT_DIR)),
       settings(OUTPUT_DIR),
       settings(CONVERTER_PATH),
-      parseTimeframes(settings(TIMEFRAMES))
+      parseTimeframes(settings(TIMEFRAMES)),
+      parseThreads(settings(THREADS))
     )
   }
 
@@ -83,6 +91,17 @@ object Configuration {
         throw new Exception("Cannot parse " + TIMEFRAMES + " " + settings(TIMEFRAMES))
       }
     }
+    if (!settings.contains(THREADS)) {
+      throw new Exception("Not defined " + THREADS)
+    }
+    try {
+      settings(THREADS).toInt
+    }
+    catch {
+      case e: Exception => {
+        throw new Exception("Cannot parse " + THREADS + " " + settings(THREADS))
+      }
+    }
   }
 
   private def listInputFiles(inputDir: String) = {
@@ -101,6 +120,15 @@ object Configuration {
     split(" ").
     map(s => s.toLong).
     toList
+
+  private def parseThreads(threads: String) = {
+    if (threads.toInt < 0) {
+      Runtime.getRuntime.availableProcessors
+    }
+    else {
+      threads.toInt
+    }
+  }
 }
 
 object Utils {
@@ -134,8 +162,8 @@ class ParentActor(val conf: Configuration) extends Actor {
 
   files ++= conf.inputFiles
 
-  val processors = Runtime.getRuntime.availableProcessors
-  println("Starting " + processors + " child actors")
+  val processors = 1 //Runtime.getRuntime.availableProcessors
+  println(new Date + " Starting " + processors + " child actors")
 
   (1 to math.min(processors, files.size))
     .map(i => context.actorOf(Props[ChildActor]))
@@ -167,9 +195,9 @@ class ParentActor(val conf: Configuration) extends Actor {
     printReport
     if (files.isEmpty) {
       if (proc_files.isEmpty) {
-        println("Failure files:")
+        println(new Date + " Failure files:")
         failure_files.foreach(println)
-        println("Terminating")
+        println(new Date + " Terminating")
         context.system.terminate
       }
     }
@@ -295,7 +323,6 @@ class ChildActor extends Actor {
       out.close()
     }
   }
-
 }
 
 object Application extends App {
