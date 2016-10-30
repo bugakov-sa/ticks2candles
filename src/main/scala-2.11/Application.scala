@@ -162,11 +162,9 @@ class ParentActor(val conf: Configuration) extends Actor {
 
   files ++= conf.inputFiles
 
-  val processors = 1 //Runtime.getRuntime.availableProcessors
-  println(new Date + " Starting " + processors + " child actors")
-
-  (1 to math.min(processors, files.size))
-    .map(i => context.actorOf(Props[ChildActor]))
+  println(new Date + " Starting " + conf.threads + " child actors")
+  (1 to math.min(conf.threads, files.size))
+    .map(i => context.actorOf(Props[ChildActor].withDispatcher("my-pinned-dispatcher")))
     .foreach(a => sendChildTask(a))
 
   def sendChildTask(actor: ActorRef) = {
@@ -323,6 +321,7 @@ class ChildActor extends Actor {
       out.close()
     }
   }
+
 }
 
 object Application extends App {
