@@ -8,12 +8,15 @@ TODO:
 import java.io.{File, PrintWriter}
 import java.nio.file.Paths
 import java.text.SimpleDateFormat
-import java.util.{TimeZone, Date}
+import java.time.Instant
+import java.time.temporal.TemporalField
+import java.util.{Calendar, TimeZone, Date}
 
 import akka.actor._
 
 import scala.collection.mutable
 import scala.io.Source
+import scala.concurrent.duration._
 
 case class Configuration(
                           inputFiles: List[String],
@@ -156,9 +159,9 @@ class ParentActor(val conf: Configuration) extends Actor {
   import ChildActor._
 
   val files = mutable.Buffer[String]()
-  val proc_files = mutable.Buffer[String]()
-  val success_files = mutable.Buffer[String]()
-  val failure_files = mutable.Buffer[String]()
+  val procFiles = mutable.Buffer[String]()
+  val successFiles = mutable.Buffer[String]()
+  val failureFiles = mutable.Buffer[String]()
 
   files ++= conf.inputFiles
 
@@ -172,18 +175,18 @@ class ParentActor(val conf: Configuration) extends Actor {
     val outputFiles = conf.timeframes.map(t => (t, Paths.get(conf.outputDir, code, date + "-" + t + ".csv").toString)).toMap
     Paths.get(conf.outputDir, code).toFile.mkdirs
     actor ! ChildTask(files(0), outputFiles, conf.converterFile)
-    proc_files += files(0)
+    procFiles += files(0)
     files.remove(0)
   }
 
   override def receive: Receive = {
     case msg: ChildTaskSuccess =>
-      proc_files -= msg.inputFile
-      success_files += msg.inputFile
+      procFiles -= msg.inputFile
+      successFiles += msg.inputFile
       tryProcNextFile
     case msg: ChildTaskFailure =>
-      proc_files -= msg.inputFile
-      failure_files += msg.inputFile
+      procFiles -= msg.inputFile
+      failureFiles += msg.inputFile
       println("Error at file " + msg.inputFile + " : " + msg.e.getMessage)
       msg.e.printStackTrace()
       tryProcNextFile
@@ -192,9 +195,9 @@ class ParentActor(val conf: Configuration) extends Actor {
   def tryProcNextFile = {
     printReport
     if (files.isEmpty) {
-      if (proc_files.isEmpty) {
+      if (procFiles.isEmpty) {
         println(new Date + " Failure files:")
-        failure_files.foreach(println)
+        failureFiles.foreach(println)
         println(new Date + " Terminating")
         context.system.terminate
       }
@@ -206,15 +209,14 @@ class ParentActor(val conf: Configuration) extends Actor {
 
   def printReport = {
 
-    val total = conf.inputFiles.size
-    val processed = success_files.size + failure_files.size
-    val percent = Math.round((processed.toFloat / total) * 10000f) / 100f
+    val percent = 100 * (successFiles.size + failureFiles.size).toFloat / conf.inputFiles.size
 
     println(new Date +
-      " progress(%) " + percent +
-      " success " + success_files.size +
-      " failure " + failure_files.size +
-      " total " + total)
+      " progress(%) " + f"$percent%02.2f" +
+      " success " + successFiles.size +
+      " failure " + failureFiles.size +
+      " total " + conf.inputFiles.size
+    )
   }
 }
 
@@ -300,7 +302,7 @@ class ChildActor extends Actor {
     val candles = scala.collection.mutable.LinkedHashMap[String, ChildActor.this.Candle]()
 
     def add(receiveTime: String, exchangeTime: String, price: String) = {
-      val receiveTimeHour = (millisFromTxt(receiveTime) % (24 * 60 * 60 * 1000)) / (60 * 60 * 1000)
+      val receiveTimeHour = (millisFromTxt(receiveTime) % (1 day).toMillis) / (1 hour).toMillis
       if (receiveTimeHour >= 10) {
         val candleTime = millis2Csv((millisFromTxt(exchangeTime) / timeframe) * timeframe + timeframe / 2)
         if (candles.contains(candleTime)) {
