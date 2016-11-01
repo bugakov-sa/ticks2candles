@@ -1,7 +1,6 @@
 /*
 TODO:
 2. Логировать длительность работы
-3. Отвязаться от фиксированной структуры папок с входными данными
  */
 
 import java.io.{File, PrintWriter}
@@ -107,13 +106,16 @@ object Configuration {
     }
   }
 
-  private def listInputFiles(inputDir: String) = {
-    val res = Paths.get(inputDir).
-      toFile.
-      listFiles.
-      flatMap(f => f.listFiles).
-      map(f => f.getAbsolutePath).
-      filter(n => n.endsWith(".qsh")).
+  private def listInputFiles(inputDir: String): List[String] = {
+    val dirFiles = new File(inputDir).listFiles
+    val res = dirFiles.
+      filter(_.isFile).
+      filter(_.getName.endsWith(".qsh")).
+      map(_.getAbsolutePath).
+      toList ::: dirFiles.
+      filter(_.isDirectory).
+      map(_.getAbsolutePath).
+      flatMap(listInputFiles _).
       toList
     log.info("Found {} files", res.size)
     res
@@ -121,11 +123,11 @@ object Configuration {
 
   private def parseTimeframes(timeframes: String) = timeframes.
     split(" ").
-    map(s => s.toLong).
+    map(_.toLong).
     toList
 
   private def parseThreads(threads: String) = {
-    if (threads.toInt < 0) {
+    if (threads.toInt <= 0) {
       Runtime.getRuntime.availableProcessors
     }
     else {
@@ -217,7 +219,7 @@ class ParentActor(val conf: Configuration) extends Actor {
   log.info(" Starting {} child actors", childActorsCount)
   (1 to childActorsCount)
     .map(i => context.actorOf(Props[ChildActor].withDispatcher("my-pinned-dispatcher")))
-    .foreach(a => sendChildTask(a))
+    .foreach(sendChildTask _)
 
   def sendChildTask(actor: ActorRef) = {
     val Utils.qshFileNamePattern(code, date) = Paths.get(files(0)).getFileName.toString
@@ -262,7 +264,7 @@ class ParentActor(val conf: Configuration) extends Actor {
 
     val percent = 100 * (successFiles.size + failureFiles.size).toFloat / conf.inputFiles.size
 
-    log.info("Progress(%) {} success {} failure {} total {}",
+    log.info("Progress {} (%, success, failure, total)",
       Array(
         f"$percent%02.2f",
         successFiles.size,
@@ -311,7 +313,7 @@ class ChildActor extends Actor {
         val price: String = cells(7)
         val receiveMillis = timeFormatter.millisFromTxt(cells(0))
         val executeMillis = timeFormatter.millisFromTxt(cells(1))
-        candlesBatches.values.foreach(cb => cb.add(price, receiveMillis, executeMillis))
+        candlesBatches.values.foreach(_.add(price, receiveMillis, executeMillis))
       }
       src.close()
       candlesBatches.foreach(p => saveCandles2csv(p._2, p._1))
@@ -327,7 +329,8 @@ class ChildActor extends Actor {
       val Utils.qshFileNamePattern(code, date) = inputFileName
       name.contains(code) && name.contains(date) && name.endsWith(".txt")
     })
-    if (tempFileNames.isEmpty) None else Some(Paths.get(inputFilePath.toString, tempFileNames(0)).toString)
+    if (tempFileNames.isEmpty) None
+    else Some(Paths.get(inputFilePath.toString, tempFileNames(0)).toString)
   }
 
   def saveCandles2csv(candles: CandlesBatch, csvPath: String) = {
