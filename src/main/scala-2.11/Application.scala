@@ -1,6 +1,5 @@
 /*
 TODO:
-1. Писать логи в файл
 2. Логировать длительность работы
 3. Отвязаться от фиксированной структуры папок с входными данными
  */
@@ -11,6 +10,7 @@ import java.text.SimpleDateFormat
 import java.util.{Date, TimeZone}
 
 import akka.actor._
+import com.typesafe.scalalogging.Logger
 
 import scala.collection.mutable
 import scala.concurrent.duration._
@@ -25,6 +25,8 @@ case class Configuration(
                         )
 
 object Configuration {
+
+  private val log = Logger[Configuration]
 
   private val INPUT_DIR = "inputDir"
   private val OUTPUT_DIR = "outputDir"
@@ -64,9 +66,9 @@ object Configuration {
       yield (kv(0).trim, kv(1).trim)).toMap
     src.close
 
-    println("Settings:")
+    log.info("Settings:")
     for ((k, v) <- settings) {
-      println(k + "=" + v)
+      log.info("{} = {}", k, v)
     }
 
     settings
@@ -113,7 +115,7 @@ object Configuration {
       map(f => f.getAbsolutePath).
       filter(n => n.endsWith(".qsh")).
       toList
-    println("Found " + res.size + " files")
+    log.info("Found {} files", res.size)
     res
   }
 
@@ -199,6 +201,8 @@ object ChildActor {
 
 class ParentActor(val conf: Configuration) extends Actor {
 
+  private val log = Logger[ParentActor]
+
   import ChildActor._
   import ParentActor._
 
@@ -210,7 +214,7 @@ class ParentActor(val conf: Configuration) extends Actor {
   files ++= conf.inputFiles
 
   private val childActorsCount: Int = math.min(conf.threads, files.size)
-  println(new Date + " Starting " + childActorsCount + " child actors")
+  log.info(" Starting {} child actors", childActorsCount)
   (1 to childActorsCount)
     .map(i => context.actorOf(Props[ChildActor].withDispatcher("my-pinned-dispatcher")))
     .foreach(a => sendChildTask(a))
@@ -235,8 +239,7 @@ class ParentActor(val conf: Configuration) extends Actor {
     case msg: ChildTaskFailure =>
       procFiles -= msg.inputFile
       failureFiles += msg.inputFile
-      println("Error at file " + msg.inputFile + " : " + msg.e.getMessage)
-      msg.e.printStackTrace()
+      log.error("Error at file " + msg.inputFile + " : " + msg.e.getMessage, msg.e)
       tryProcNextFile
   }
 
@@ -244,9 +247,9 @@ class ParentActor(val conf: Configuration) extends Actor {
     printReport
     if (files.isEmpty) {
       if (procFiles.isEmpty) {
-        println(new Date + " Failure files:")
-        failureFiles.foreach(println)
-        println(new Date + " Terminating")
+        log.info("Failure files:")
+        failureFiles.foreach(f => log.info(f))
+        log.info("Terminating")
         context.system.terminate
       }
     }
@@ -259,11 +262,13 @@ class ParentActor(val conf: Configuration) extends Actor {
 
     val percent = 100 * (successFiles.size + failureFiles.size).toFloat / conf.inputFiles.size
 
-    println(new Date +
-      " progress(%) " + f"$percent%02.2f" +
-      " success " + successFiles.size +
-      " failure " + failureFiles.size +
-      " total " + conf.inputFiles.size
+    log.info("Progress(%) {} success {} failure {} total {}",
+      Array(
+        f"$percent%02.2f",
+        successFiles.size,
+        failureFiles.size,
+        conf.inputFiles.size
+      )
     )
   }
 }
