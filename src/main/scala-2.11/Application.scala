@@ -8,15 +8,13 @@ TODO:
 import java.io.{File, PrintWriter}
 import java.nio.file.Paths
 import java.text.SimpleDateFormat
-import java.time.Instant
-import java.time.temporal.TemporalField
-import java.util.{Calendar, TimeZone, Date}
+import java.util.{Date, TimeZone}
 
 import akka.actor._
 
 import scala.collection.mutable
-import scala.io.Source
 import scala.concurrent.duration._
+import scala.io.Source
 
 case class Configuration(
                           inputFiles: List[String],
@@ -138,6 +136,52 @@ object Utils {
   val qshFileNamePattern = "OrdLog.(\\w+-\\d+.\\d+).(\\d{4}.\\d{1,2}.\\d{1,2}).qsh".r
 }
 
+class TimeFormatter {
+  private val txtTimestampFormat = new SimpleDateFormat("dd.MM.yyyy HH:mm:ss.SSS")
+  txtTimestampFormat.setTimeZone(TimeZone.getTimeZone("GMT"))
+
+  def millisFromTxt(timeText: String) = txtTimestampFormat.parse(timeText).getTime
+
+  private val csvTimestampFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
+  csvTimestampFormat.setTimeZone(TimeZone.getTimeZone("GMT"))
+
+  def millis2Csv(millis: Long) = csvTimestampFormat.format(new Date(millis))
+}
+
+class Candle(val open: String) {
+  var low = open
+  var high = open
+  var close = open
+
+  def add(price: String) = {
+    if (low.toFloat > price.toFloat) {
+      low = price
+    }
+    if (high.toFloat < price.toFloat) {
+      high = price
+    }
+    close = price
+  }
+}
+
+class CandlesBatch(val timeframe: Long) {
+  val candles = scala.collection.mutable.LinkedHashMap[Long, Candle]()
+
+  def add(price: String, receiveMillis: Long, executeMillis: Long) = {
+    val receiveInDayMillis = receiveMillis % (1 day).toMillis
+    val startTradeInDayMillis = (10 hours).toMillis
+    if (receiveInDayMillis >= startTradeInDayMillis) {
+      val middleOfCandleMillis = executeMillis - executeMillis % timeframe + timeframe / 2
+      if (candles.contains(middleOfCandleMillis)) {
+        candles(middleOfCandleMillis).add(price)
+      }
+      else {
+        candles(middleOfCandleMillis) = new Candle(price)
+      }
+    }
+  }
+}
+
 object ParentActor {
 
   case class ChildTaskSuccess(inputFile: String)
@@ -155,8 +199,8 @@ object ChildActor {
 
 class ParentActor(val conf: Configuration) extends Actor {
 
-  import ParentActor._
   import ChildActor._
+  import ParentActor._
 
   val files = mutable.Buffer[String]()
   val procFiles = mutable.Buffer[String]()
@@ -165,14 +209,18 @@ class ParentActor(val conf: Configuration) extends Actor {
 
   files ++= conf.inputFiles
 
-  println(new Date + " Starting " + conf.threads + " child actors")
-  (1 to math.min(conf.threads, files.size))
+  private val childActorsCount: Int = math.min(conf.threads, files.size)
+  println(new Date + " Starting " + childActorsCount + " child actors")
+  (1 to childActorsCount)
     .map(i => context.actorOf(Props[ChildActor].withDispatcher("my-pinned-dispatcher")))
     .foreach(a => sendChildTask(a))
 
   def sendChildTask(actor: ActorRef) = {
     val Utils.qshFileNamePattern(code, date) = Paths.get(files(0)).getFileName.toString
-    val outputFiles = conf.timeframes.map(t => (t, Paths.get(conf.outputDir, code, date + "-" + t + ".csv").toString)).toMap
+    val outputFiles = conf.timeframes.map(timeframe => (
+      timeframe,
+      Paths.get(conf.outputDir, code, "$date%-$timeframe%.csv").toString)
+    ).toMap
     Paths.get(conf.outputDir, code).toFile.mkdirs
     actor ! ChildTask(files(0), outputFiles, conf.converterFile)
     procFiles += files(0)
@@ -225,6 +273,8 @@ class ChildActor extends Actor {
   import ChildActor._
   import ParentActor._
 
+  val timeFormatter = new TimeFormatter
+
   override def receive: Actor.Receive = {
     case task: ChildTask =>
       try {
@@ -253,10 +303,13 @@ class ChildActor extends Actor {
       val candlesBatches = task.outputFiles.map(p => (p._2, new CandlesBatch(p._1)))
       for (line <- src.getLines() if filterLine(line)) {
         val cells = line.split(";")
-        candlesBatches.values.foreach(cb => cb.add(cells(0), cells(1), cells(7)))
+        val price: String = cells(7)
+        val receiveMillis = timeFormatter.millisFromTxt(cells(0))
+        val executeMillis = timeFormatter.millisFromTxt(cells(1))
+        candlesBatches.values.foreach(cb => cb.add(price, receiveMillis, executeMillis))
       }
       src.close()
-      candlesBatches.foreach(p => p._2.save2csv(p._1))
+      candlesBatches.foreach(p => saveCandles2csv(p._2, p._1))
     }
   }
 
@@ -272,58 +325,14 @@ class ChildActor extends Actor {
     if (tempFileNames.isEmpty) None else Some(Paths.get(inputFilePath.toString, tempFileNames(0)).toString)
   }
 
-  val txtTimestampFormat = new SimpleDateFormat("dd.MM.yyyy HH:mm:ss.SSS")
-  txtTimestampFormat.setTimeZone(TimeZone.getTimeZone("GMT"))
-
-  def millisFromTxt(timeText: String) = txtTimestampFormat.parse(timeText).getTime
-
-  val csvTimestampFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss")
-  csvTimestampFormat.setTimeZone(TimeZone.getTimeZone("GMT"))
-
-  def millis2Csv(millis: Long) = csvTimestampFormat.format(new Date(millis))
-
-  class Candle(val open: String) {
-    var low = open
-    var high = open
-    var close = open
-
-    def add(price: String) = {
-      if (low.toFloat > price.toFloat) {
-        low = price
-      }
-      if (high.toFloat < price.toFloat) {
-        high = price
-      }
-      close = price
+  def saveCandles2csv(candles: CandlesBatch, csvPath: String) = {
+    val out = new PrintWriter(csvPath)
+    out.write("t,open,high,low,close\n")
+    for ((t, c) <- candles.candles) {
+      out.write(timeFormatter.millis2Csv(t) + "," + c.open + "," + c.high + "," + c.low + "," + c.close + "\n")
     }
+    out.close()
   }
-
-  class CandlesBatch(val timeframe: Long) {
-    val candles = scala.collection.mutable.LinkedHashMap[String, ChildActor.this.Candle]()
-
-    def add(receiveTime: String, exchangeTime: String, price: String) = {
-      val receiveTimeHour = (millisFromTxt(receiveTime) % (1 day).toMillis) / (1 hour).toMillis
-      if (receiveTimeHour >= 10) {
-        val candleTime = millis2Csv((millisFromTxt(exchangeTime) / timeframe) * timeframe + timeframe / 2)
-        if (candles.contains(candleTime)) {
-          candles(candleTime).add(price)
-        }
-        else {
-          candles(candleTime) = new Candle(price)
-        }
-      }
-    }
-
-    def save2csv(csvPath: String) = {
-      val out = new PrintWriter(csvPath)
-      out.write("t,open,high,low,close\n")
-      for ((t, c) <- candles) {
-        out.write(t + "," + c.open + "," + c.high + "," + c.low + "," + c.close + "\n")
-      }
-      out.close()
-    }
-  }
-
 }
 
 object Application extends App {
