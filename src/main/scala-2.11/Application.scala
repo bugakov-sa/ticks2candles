@@ -1,9 +1,7 @@
 /*
 TODO:
 1. Поддержать скачивание файлов по ftp
-2. Логировать длительность работы
  */
-
 import java.io.{File, PrintWriter}
 import java.nio.file.Paths
 import java.text.SimpleDateFormat
@@ -11,6 +9,7 @@ import java.util.{Date, TimeZone}
 
 import akka.actor._
 import com.typesafe.scalalogging.Logger
+import org.apache.commons.lang3.time.DurationFormatUtils.formatDuration
 
 import scala.collection.mutable
 import scala.concurrent.duration._
@@ -216,7 +215,8 @@ class ParentActor(val conf: Configuration) extends Actor {
 
   files ++= conf.inputFiles
 
-  private val childActorsCount: Int = math.min(conf.threads, files.size)
+  val startTime = System.currentTimeMillis
+  val childActorsCount = math.min(conf.threads, files.size)
   log.info(" Starting {} child actors", childActorsCount)
   (1 to childActorsCount)
     .map(i => context.actorOf(Props[ChildActor].withDispatcher("my-pinned-dispatcher")))
@@ -264,14 +264,16 @@ class ParentActor(val conf: Configuration) extends Actor {
   def printReport = {
 
     val percent = 100 * (successFiles.size + failureFiles.size).toFloat / conf.inputFiles.size
+    val timePassedMillis = System.currentTimeMillis - startTime
+    val timeLeftMillis = math.round(((100 - percent) / percent) * timePassedMillis)
 
-    log.info("Progress {} (%, success, failure, total)",
-      Array(
-        f"$percent%02.2f",
-        successFiles.size,
-        failureFiles.size,
-        conf.inputFiles.size
-      )
+    log.info("Progress(%) {} success {} failure {} total {}. Time passed {} left {}.",
+      f"$percent%02.2f",
+      successFiles.size toString,
+      failureFiles.size toString,
+      conf.inputFiles.size toString,
+      formatDuration(timePassedMillis, "HH:mm:ss"),
+      formatDuration(timeLeftMillis, "HH:mm:ss")
     )
   }
 }
